@@ -61,7 +61,7 @@ func (sp *SyncPlugin) OnBoot(config map[string]string) error {
 	// If already authenticated (env var or saved creds), start sync.
 	if sp.Auth.IsAuthenticated() {
 		creds := sp.Auth.Creds()
-		engine.SetAuth(creds.Token, creds.TeamID, creds.DeviceID)
+		engine.SetAuth(creds.Token, creds.TeamID, "", creds.DeviceID)
 		// Start without a context — engine.Start creates its own cancellable context.
 		engine.Start(nil)
 		log.Printf("sync.cloud: auto-started sync for %s", creds.Email)

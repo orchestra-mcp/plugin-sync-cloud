@@ -133,7 +133,7 @@ func LoginHandler(sp PluginAccessor) ToolHandler {
 func loginSuccess(ctx context.Context, sp PluginAccessor, token, email, name, userID, deviceID, teamID, apiURL string) (*pluginv1.ToolResponse, error) {
 	// Start sync engine with new credentials.
 	if engine := sp.SyncEngine(); engine != nil {
-		engine.SetAuth(token, teamID, deviceID)
+		engine.SetAuth(token, teamID, "", deviceID)
 		engine.Start(ctx)
 	}
 

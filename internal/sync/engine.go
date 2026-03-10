@@ -41,6 +41,7 @@ type Engine struct {
 	// Auth state (set externally).
 	token    string
 	teamID   string
+	tunnelID string
 	deviceID string
 }
 
@@ -61,11 +62,12 @@ func NewEngine(client *CloudClient, storage StorageReader, workspace, deviceID s
 }
 
 // SetAuth updates the authentication credentials.
-func (e *Engine) SetAuth(token, teamID, deviceID string) {
+func (e *Engine) SetAuth(token, teamID, tunnelID, deviceID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.token = token
 	e.teamID = teamID
+	e.tunnelID = tunnelID
 	e.deviceID = deviceID
 }
 
@@ -168,6 +170,7 @@ func (e *Engine) doSync(ctx context.Context) (applied, skipped, errors int, err 
 	e.mu.Lock()
 	token := e.token
 	teamID := e.teamID
+	tunnelID := e.tunnelID
 	deviceID := e.deviceID
 	e.mu.Unlock()
 
@@ -226,6 +229,7 @@ func (e *Engine) doSync(ctx context.Context) (applied, skipped, errors int, err 
 
 		pushResp, err := e.client.Push(token, PushRequest{
 			DeviceID: deviceID,
+			TunnelID: tunnelID,
 			Records:  batch,
 		})
 		if err != nil {

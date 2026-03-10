@@ -20,9 +20,17 @@ type Sender interface {
 // Cleanup is a function to call on shutdown to stop the sync engine.
 type Cleanup func()
 
-// Register adds all 5 sync-cloud tools to the builder and returns a cleanup
-// function that must be called on shutdown to stop the sync engine.
-func Register(builder *plugin.PluginBuilder, sender Sender) Cleanup {
+// SyncNowFunc triggers an immediate sync and returns results.
+type SyncNowFunc func(ctx context.Context) (applied, skipped, errors int, err error)
+
+// SetAuthFunc updates the sync engine's authentication credentials.
+type SetAuthFunc func(token, teamID, tunnelID, deviceID string)
+
+// Register adds all 5 sync-cloud tools to the builder and returns:
+//   - cleanup: must be called on shutdown to stop the sync engine
+//   - syncNow: triggers an immediate sync (returns nil if engine not ready)
+//   - setAuth: updates auth credentials (e.g., from tunnel claim)
+func Register(builder *plugin.PluginBuilder, sender Sender) (Cleanup, SyncNowFunc, SetAuthFunc) {
 	apiURL := os.Getenv("ORCHESTRA_API_URL")
 	if apiURL == "" {
 		apiURL = "http://localhost:8080"
@@ -32,7 +40,7 @@ func Register(builder *plugin.PluginBuilder, sender Sender) Cleanup {
 	authStore, err := auth.NewStore()
 	if err != nil {
 		log.Printf("sync.cloud: init auth store: %v", err)
-		return func() {}
+		return func() {}, nil, nil
 	}
 	authMgr := auth.NewManager(authStore, cloudClient)
 
@@ -49,9 +57,29 @@ func Register(builder *plugin.PluginBuilder, sender Sender) Cleanup {
 		log.Printf("sync.cloud: boot error: %v", err)
 	}
 
-	return func() {
+	cleanup := func() {
 		_ = sp.OnShutdown()
 	}
+
+	syncNow := func(ctx context.Context) (int, int, int, error) {
+		engine := sp.Engine
+		if engine == nil {
+			return 0, 0, 0, nil
+		}
+		return engine.SyncNow(ctx)
+	}
+
+	setAuth := func(token, teamID, tunnelID, deviceID string) {
+		engine := sp.Engine
+		if engine == nil {
+			return
+		}
+		engine.SetAuth(token, teamID, tunnelID, deviceID)
+		// Start the engine if not already running.
+		engine.Start(nil)
+	}
+
+	return cleanup, syncNow, setAuth
 }
 
 // senderAdapter wraps a Sender to satisfy cloudsync.StorageReader.

@@ -203,6 +203,7 @@ type SyncRecord struct {
 // PushRequest is the body for POST /api/sync/push.
 type PushRequest struct {
 	DeviceID string       `json:"device_id"`
+	TunnelID string       `json:"tunnel_id,omitempty"`
 	Records  []SyncRecord `json:"records"`
 }
 
