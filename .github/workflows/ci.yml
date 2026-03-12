@@ -10,6 +10,7 @@ env:
   GONOSUMCHECK: github.com/orchestra-mcp/*
   GONOSUMDB: github.com/orchestra-mcp/*
   GOFLAGS: -mod=mod
+  GOPROXY: "https://proxy.golang.org,direct"
 
 jobs:
   test:
@@ -23,9 +24,10 @@ jobs:
 
       - name: Download dependencies
         run: |
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             go mod download && break
-            echo "Retry $i: waiting for Go proxy to index..."
+            echo "Attempt $i failed, retrying with GOPROXY=direct..."
+            GOPROXY=direct go mod download && break
             sleep 15
           done
 
