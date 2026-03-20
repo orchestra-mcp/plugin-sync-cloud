@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -49,6 +50,7 @@ type LoginRequest struct {
 type LoginResponse struct {
 	Token       string       `json:"token"`
 	User        UserResponse `json:"user"`
+	TeamID      string       `json:"team_id,omitempty"`
 	Requires2FA bool         `json:"requires_2fa"`
 	TempToken   string       `json:"temp_token,omitempty"`
 }
@@ -143,6 +145,7 @@ type DevicePollResponse struct {
 	Status string       `json:"status"` // "pending" or "approved"
 	Token  string       `json:"token,omitempty"`
 	User   UserResponse `json:"user,omitempty"`
+	TeamID string       `json:"team_id,omitempty"`
 }
 
 // DeviceRequest initiates a device auth flow. No auth token is needed.
@@ -228,6 +231,55 @@ func (cc *CloudClient) Push(token string, req PushRequest) (*PushResponse, error
 	return &resp, nil
 }
 
+// --- Pull ---
+
+// PullRequest is the query params for GET /api/sync/pull.
+type PullRequest struct {
+	DeviceID string `json:"device_id"`
+	Since    string `json:"since"` // RFC3339 timestamp
+	Limit    int    `json:"limit"`
+}
+
+// PullRecord is a single entity change from the cloud (mirrors SyncLog).
+type PullRecord struct {
+	ID         string          `json:"id"`
+	EntityType string          `json:"entity_type"`
+	EntityID   string          `json:"entity_id"`
+	Action     string          `json:"action"` // upsert | delete
+	Payload    json.RawMessage `json:"payload"`
+	Version    int64           `json:"version"`
+	TeamID     *string         `json:"team_id"`
+	CreatedAt  time.Time       `json:"created_at"`
+}
+
+// PullResponse is the response from GET /api/sync/pull.
+type PullResponse struct {
+	Records []PullRecord `json:"records"`
+	Count   int          `json:"count"`
+}
+
+// Pull fetches sync records from the cloud since the given cursor.
+func (cc *CloudClient) Pull(token string, req PullRequest) (*PullResponse, error) {
+	path := "/api/sync/pull?"
+	params := ""
+	if req.DeviceID != "" {
+		params += "device_id=" + req.DeviceID + "&"
+	}
+	if req.Since != "" {
+		params += "since=" + url.QueryEscape(req.Since) + "&"
+	}
+	if req.Limit > 0 {
+		params += "limit=" + fmt.Sprintf("%d", req.Limit) + "&"
+	}
+	path += params
+
+	var resp PullResponse
+	if err := cc.get(path, token, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // RegisterDevice registers this device with the cloud.
 func (cc *CloudClient) RegisterDevice(token, deviceID, name, platform string) error {
 	body := map[string]string{
@@ -254,6 +306,74 @@ func (cc *CloudClient) SyncStatus(token, deviceID string) (*StatusResponse, erro
 		path += "?device_id=" + deviceID
 	}
 	if err := cc.get(path, token, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// --- Workspaces ---
+
+// WorkspaceSyncRequest is the body for POST /api/workspaces/sync.
+type WorkspaceSyncRequest struct {
+	Name          string   `json:"name"`
+	Folders       []string `json:"folders"`
+	PrimaryFolder string   `json:"primary_folder"`
+	Source        string   `json:"source"`
+	LocalID       string   `json:"local_id"`
+}
+
+// SyncWorkspace upserts a workspace to the cloud.
+func (cc *CloudClient) SyncWorkspace(token string, req WorkspaceSyncRequest) error {
+	var resp map[string]interface{}
+	return cc.post("/api/workspaces/sync", token, req, &resp)
+}
+
+// --- Export ---
+
+// ExportResponse is the response from GET /api/sync/export.
+type ExportResponse struct {
+	Projects   []json.RawMessage `json:"projects"`
+	Features   []json.RawMessage `json:"features"`
+	Notes      []json.RawMessage `json:"notes"`
+	Plans      []json.RawMessage `json:"plans"`
+	Persons    []json.RawMessage `json:"persons"`
+	Docs       []json.RawMessage `json:"docs"`
+	Prompts    []json.RawMessage `json:"prompts"`
+	Actions    []json.RawMessage `json:"actions"`
+	Skills     []json.RawMessage `json:"skills"`
+	Agents     []json.RawMessage `json:"agents"`
+	Members    []json.RawMessage `json:"members"`
+	ExportedAt string            `json:"exported_at"`
+}
+
+// MemberRow represents a team member returned from the cloud API.
+type MemberRow struct {
+	MembershipID string `json:"membership_id"`
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	AvatarURL    string `json:"avatar_url"`
+	Role         string `json:"role"`
+	Status       string `json:"status"`
+}
+
+// TeamMembersResponse is the response from GET /api/team/members.
+type TeamMembersResponse struct {
+	Members []MemberRow `json:"members"`
+}
+
+// TeamMembers fetches the current user's team members from the cloud.
+func (cc *CloudClient) TeamMembers(token string) (*TeamMembersResponse, error) {
+	var resp TeamMembersResponse
+	if err := cc.get("/api/team/members", token, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// Export fetches a full data export from the cloud.
+func (cc *CloudClient) Export(token string) (*ExportResponse, error) {
+	var resp ExportResponse
+	if err := cc.get("/api/sync/export", token, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

@@ -2,13 +2,19 @@ package sync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	pluginv1 "github.com/orchestra-mcp/gen-go/orchestra/plugin/v1"
+	"github.com/orchestra-mcp/sdk-go/globaldb"
 	"github.com/orchestra-mcp/sdk-go/helpers"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // StorageReader is the interface for reading local storage via the orchestrator.
@@ -30,19 +36,29 @@ type SyncStatus struct {
 
 // Engine polls local storage for changes and pushes them to the cloud.
 type Engine struct {
-	client   *CloudClient
-	cursor   *Cursor
-	storage  StorageReader
-	interval time.Duration
-	enabled  bool
-	mu       sync.Mutex
-	cancel   context.CancelFunc
+	client    *CloudClient
+	cursor    *Cursor
+	storage   StorageReader
+	workspace string
+	interval  time.Duration
+	enabled   bool
+	mu        sync.Mutex
+	cancel    context.CancelFunc
 
 	// Auth state (set externally).
 	token    string
 	teamID   string
 	tunnelID string
 	deviceID string
+
+	// OnPullComplete is called after a pull applies changes that affect
+	// workspace docs (skills, agents). The caller (CLI) sets this to
+	// trigger GenerateWorkspaceDocs.
+	OnPullComplete func(entityTypes []string)
+
+	// OnImportComplete is called after FullImport finishes. The caller
+	// (CLI) uses this to regenerate workspace docs and rebuild RAG indexes.
+	OnImportComplete func(importedCount int)
 }
 
 // NewEngine creates a new sync engine.
@@ -52,12 +68,13 @@ func NewEngine(client *CloudClient, storage StorageReader, workspace, deviceID s
 		return nil, err
 	}
 	return &Engine{
-		client:   client,
-		cursor:   cursor,
-		storage:  storage,
-		interval: 30 * time.Second,
-		enabled:  true,
-		deviceID: deviceID,
+		client:    client,
+		cursor:    cursor,
+		storage:   storage,
+		workspace: workspace,
+		interval:  30 * time.Second,
+		enabled:   true,
+		deviceID:  deviceID,
 	}, nil
 }
 
@@ -167,6 +184,67 @@ func (e *Engine) syncOnce(ctx context.Context) error {
 }
 
 func (e *Engine) doSync(ctx context.Context) (applied, skipped, errors int, err error) {
+	// Phase 1: Push local changes to cloud.
+	pushApplied, pushSkipped, pushErrors, pushErr := e.doPush(ctx)
+	applied += pushApplied
+	skipped += pushSkipped
+	errors += pushErrors
+
+	// Phase 1b: Sync workspaces (separate from entity sync).
+	if syncErr := e.syncWorkspaces(ctx); syncErr != nil {
+		log.Printf("sync.cloud: workspace sync: %v", syncErr)
+	}
+
+	// Phase 2: Pull remote changes from cloud.
+	pullApplied, pullSkipped, pullErrors, pullErr := e.doPull(ctx)
+	applied += pullApplied
+	skipped += pullSkipped
+	errors += pullErrors
+
+	// Return the first error encountered.
+	if pushErr != nil {
+		return applied, skipped, errors, pushErr
+	}
+	return applied, skipped, errors, pullErr
+}
+
+// syncWorkspaces pushes local workspaces to the cloud via POST /api/workspaces/sync.
+// Workspaces live in globaldb (not project storage), so they need separate sync.
+func (e *Engine) syncWorkspaces(_ context.Context) error {
+	e.mu.Lock()
+	token := e.token
+	e.mu.Unlock()
+
+	if token == "" {
+		return nil
+	}
+
+	// Read workspaces directly from globaldb (same machine).
+	workspaces, err := globaldb.ListWorkspaces()
+	if err != nil {
+		return fmt.Errorf("list workspaces: %w", err)
+	}
+
+	if len(workspaces) == 0 {
+		return nil
+	}
+
+	for _, ws := range workspaces {
+		if err := e.client.SyncWorkspace(token, WorkspaceSyncRequest{
+			Name:          ws.Name,
+			Folders:       ws.Folders,
+			PrimaryFolder: ws.PrimaryFolder,
+			Source:        "desktop",
+			LocalID:       ws.ID,
+		}); err != nil {
+			log.Printf("sync.cloud: sync workspace %s: %v", ws.ID, err)
+		}
+	}
+
+	return nil
+}
+
+func (e *Engine) doPush(ctx context.Context) (applied, skipped, errors int, err error) {
 	e.mu.Lock()
 	token := e.token
 	teamID := e.teamID
@@ -283,6 +361,384 @@ func (e *Engine) entityToPath(entityType, entityID string) string {
 		}
 	}
 	return ""
+}
+
+// doPull fetches changes from the cloud and applies them locally via storage write.
+func (e *Engine) doPull(ctx context.Context) (applied, skipped, errors int, err error) {
+	e.mu.Lock()
+	token := e.token
+	deviceID := e.deviceID
+	e.mu.Unlock()
+
+	if token == "" {
+		return 0, 0, 0, fmt.Errorf("not authenticated")
+	}
+
+	since := e.cursor.GetLastPullRFC3339()
+
+	resp, err := e.client.Pull(token, PullRequest{
+		DeviceID: deviceID,
+		Since:    since,
+		Limit:    500,
+	})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("pull: %w", err)
+	}
+
+	if len(resp.Records) == 0 {
+		return 0, 0, 0, nil
+	}
+
+	var latestTime time.Time
+	docEntityTypes := map[string]bool{"skill": true, "agent": true}
+	pulledEntityTypesSet := map[string]bool{}
+	for _, rec := range resp.Records {
+		path := EntityToPath(rec.EntityType, rec.EntityID, rec.Payload)
+		if path == "" {
+			log.Printf("sync.cloud: pull: cannot map %s/%s to path", rec.EntityType, rec.EntityID)
+			skipped++
+			continue
+		}
+
+		// Check local version — skip if local is newer (LWW).
+		if !e.cursor.IsChanged(path, rec.Version) {
+			skipped++
+			continue
+		}
+
+		if rec.Action == "delete" {
+			if err := e.deleteStorage(ctx, path); err != nil {
+				log.Printf("sync.cloud: pull delete %s: %v", path, err)
+				errors++
+				continue
+			}
+		} else {
+			// Extract metadata and body from payload.
+			metadata, body := splitPayload(rec.EntityType, rec.Payload)
+			if err := e.writeStorage(ctx, path, body, metadata, rec.Version); err != nil {
+				log.Printf("sync.cloud: pull write %s: %v", path, err)
+				errors++
+				continue
+			}
+			// Write back to .claude/ filesystem so Claude Code sees the update.
+			if e.workspace != "" {
+				e.writeClaudeFile(rec.EntityType, rec.EntityID, body)
+			}
+		}
+
+		e.cursor.MarkSynced(path, rec.Version)
+		applied++
+
+		if docEntityTypes[rec.EntityType] {
+			pulledEntityTypesSet[rec.EntityType] = true
+		}
+
+		if rec.CreatedAt.After(latestTime) {
+			latestTime = rec.CreatedAt
+		}
+	}
+
+	if !latestTime.IsZero() {
+		e.cursor.SetLastPull(latestTime)
+	}
+	_ = e.cursor.Save()
+
+	// Notify the caller if doc-affecting entities (skills, agents) were pulled.
+	if e.OnPullComplete != nil && len(pulledEntityTypesSet) > 0 {
+		var pulledEntityTypes []string
+		for t := range pulledEntityTypesSet {
+			pulledEntityTypes = append(pulledEntityTypes, t)
+		}
+		e.OnPullComplete(pulledEntityTypes)
+	}
+
+	return applied, skipped, errors, nil
+}
+
+// FullImport downloads all data from the cloud and writes it to local storage.
+// Called after initial login to bootstrap local state.
+func (e *Engine) FullImport(ctx context.Context) (int, error) {
+	e.mu.Lock()
+	token := e.token
+	e.mu.Unlock()
+	if token == "" {
+		return 0, fmt.Errorf("not authenticated")
+	}
+
+	resp, err := e.client.Export(token)
+	if err != nil {
+		return 0, fmt.Errorf("export: %w", err)
+	}
+
+	imported := 0
+
+	// Import each entity type.
+	type entityBatch struct {
+		entityType string
+		items      []json.RawMessage
+	}
+	batches := []entityBatch{
+		{"project", resp.Projects},
+		{"feature", resp.Features},
+		{"note", resp.Notes},
+		{"plan", resp.Plans},
+		{"person", resp.Persons},
+		{"doc", resp.Docs},
+		{"prompt", resp.Prompts},
+		{"action", resp.Actions},
+		{"skill", resp.Skills},
+		{"agent", resp.Agents},
+	}
+
+	for _, batch := range batches {
+		for _, raw := range batch.items {
+			var data map[string]interface{}
+			if err := json.Unmarshal(raw, &data); err != nil {
+				log.Printf("sync.cloud: import unmarshal %s: %v", batch.entityType, err)
+				continue
+			}
+
+			// Extract entity ID.
+			entityID := extractEntityID(batch.entityType, data)
+			if entityID == "" {
+				continue
+			}
+
+			// Resolve path.
+			path := EntityToPath(batch.entityType, entityID, raw)
+			if path == "" {
+				continue
+			}
+
+			// Extract version.
+			var version int64 = 1
+			if v, ok := data["version"].(float64); ok {
+				version = int64(v)
+			}
+
+			// Split payload into metadata + body.
+			metadata, body := splitPayload(batch.entityType, raw)
+
+			if err := e.writeStorage(ctx, path, body, metadata, version); err != nil {
+				log.Printf("sync.cloud: import write %s/%s: %v", batch.entityType, entityID, err)
+				continue
+			}
+
+			// Write back to .claude/ filesystem for skills and agents.
+			if e.workspace != "" {
+				e.writeClaudeFile(batch.entityType, entityID, body)
+			}
+
+			e.cursor.MarkSynced(path, version)
+			imported++
+		}
+	}
+
+	// Import team members as persons.
+	// Find the default project slug from the imported projects.
+	var defaultProjectSlug string
+	for _, raw := range resp.Projects {
+		var proj map[string]interface{}
+		if json.Unmarshal(raw, &proj) == nil {
+			if slug, ok := proj["slug"].(string); ok {
+				defaultProjectSlug = slug
+				break
+			}
+		}
+	}
+
+	if defaultProjectSlug != "" && len(resp.Members) > 0 {
+		for _, raw := range resp.Members {
+			var member MemberRow
+			if err := json.Unmarshal(raw, &member); err != nil {
+				log.Printf("sync.cloud: import member unmarshal: %v", err)
+				continue
+			}
+			if member.MembershipID == "" {
+				continue
+			}
+
+			personID := MembershipToPersonID(member.MembershipID)
+			role := MapMembershipRole(member.Role)
+
+			personData := map[string]interface{}{
+				"id":           personID,
+				"project_slug": defaultProjectSlug,
+				"name":         member.Name,
+				"email":        member.Email,
+				"role":         role,
+				"status":       member.Status,
+				"integrations": map[string]string{
+					"cloud_membership_id": member.MembershipID,
+					"avatar_url":          member.AvatarURL,
+				},
+			}
+			payload, err := json.Marshal(personData)
+			if err != nil {
+				continue
+			}
+			metadata, body := splitPayload("person", payload)
+			path := defaultProjectSlug + "/persons/" + personID + ".md"
+
+			if err := e.writeStorage(ctx, path, body, metadata, 1); err != nil {
+				log.Printf("sync.cloud: import member %s: %v", personID, err)
+				continue
+			}
+			e.cursor.MarkSynced(path, 1)
+			imported++
+		}
+	}
+
+	now := time.Now()
+	e.cursor.SetLastSync(now)
+	e.cursor.SetLastPull(now)
+	_ = e.cursor.Save()
+
+	// Notify caller to regenerate docs and rebuild RAG indexes.
+	if e.OnImportComplete != nil && imported > 0 {
+		e.OnImportComplete(imported)
+	}
+
+	return imported, nil
+}
+
+// extractEntityID pulls the entity ID from a data map based on entity type.
+func extractEntityID(entityType string, data map[string]interface{}) string {
+	switch entityType {
+	case "project":
+		if v, ok := data["slug"].(string); ok {
+			return v
+		}
+	case "feature":
+		if v, ok := data["feature_id"].(string); ok {
+			return v
+		}
+		if v, ok := data["id"].(string); ok {
+			return v
+		}
+	case "plan":
+		if v, ok := data["plan_id"].(string); ok {
+			return v
+		}
+		if v, ok := data["id"].(string); ok {
+			return v
+		}
+	case "person":
+		if v, ok := data["person_id"].(string); ok {
+			return v
+		}
+		if v, ok := data["id"].(string); ok {
+			return v
+		}
+	case "doc":
+		if v, ok := data["doc_id"].(string); ok {
+			return v
+		}
+		if v, ok := data["slug"].(string); ok {
+			return v
+		}
+	case "note", "prompt", "action":
+		if v, ok := data["id"].(string); ok {
+			return v
+		}
+	case "skill", "agent":
+		if v, ok := data["slug"].(string); ok {
+			return v
+		}
+	}
+	// Fallback to "id".
+	if v, ok := data["id"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// splitPayload separates the body/content/script field from metadata fields.
+func splitPayload(entityType string, payload json.RawMessage) (*structpb.Struct, []byte) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return nil, nil
+	}
+
+	var body []byte
+	switch entityType {
+	case "feature", "note", "plan", "person", "request", "assignment_rule", "ai_session", "session_turn", "doc", "prompt", "action", "delegation":
+		if v, ok := data["body"].(string); ok {
+			body = []byte(v)
+			delete(data, "body")
+		}
+	case "skill", "agent":
+		if v, ok := data["content"].(string); ok {
+			body = []byte(v)
+			delete(data, "content")
+		}
+	}
+
+	metadata, err := structpb.NewStruct(data)
+	if err != nil {
+		return nil, body
+	}
+	return metadata, body
+}
+
+// writeStorage writes a file via the storage plugin.
+func (e *Engine) writeStorage(ctx context.Context, path string, content []byte, metadata *structpb.Struct, version int64) error {
+	_, err := e.storage.Send(ctx, &pluginv1.PluginRequest{
+		RequestId: helpers.NewUUID(),
+		Request: &pluginv1.PluginRequest_StorageWrite{
+			StorageWrite: &pluginv1.StorageWriteRequest{
+				Path:            path,
+				Content:         content,
+				Metadata:        metadata,
+				ExpectedVersion: -1, // Upsert unconditionally (cloud is authoritative on pull)
+				StorageType:     "markdown",
+			},
+		},
+	})
+	return err
+}
+
+// deleteStorage deletes a file via the storage plugin.
+func (e *Engine) deleteStorage(ctx context.Context, path string) error {
+	_, err := e.storage.Send(ctx, &pluginv1.PluginRequest{
+		RequestId: helpers.NewUUID(),
+		Request: &pluginv1.PluginRequest_StorageDelete{
+			StorageDelete: &pluginv1.StorageDeleteRequest{
+				Path:        path,
+				StorageType: "markdown",
+			},
+		},
+	})
+	return err
+}
+
+// writeClaudeFile writes pulled skill/agent content back to .claude/ filesystem
+// so Claude Code slash commands and agents stay in sync with cloud changes.
+func (e *Engine) writeClaudeFile(entityType, entityID string, content []byte) {
+	if len(content) == 0 || e.workspace == "" {
+		return
+	}
+	// entityID for skills/agents is the slug (e.g. "qa-testing", "frontend-dev").
+	slug := strings.TrimSuffix(entityID, ".md")
+	if slug == "" {
+		return
+	}
+	var filePath string
+	switch entityType {
+	case "skill":
+		filePath = filepath.Join(e.workspace, ".claude", "skills", slug, "SKILL.md")
+	case "agent":
+		filePath = filepath.Join(e.workspace, ".claude", "agents", slug+".md")
+	default:
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		log.Printf("sync.cloud: writeClaudeFile mkdir %s: %v", filePath, err)
+		return
+	}
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		log.Printf("sync.cloud: writeClaudeFile write %s: %v", filePath, err)
+	}
 }
 
 // listStorage queries the orchestrator for all storage entries.

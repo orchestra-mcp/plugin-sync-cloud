@@ -155,6 +155,7 @@ func (m *Manager) finishLogin(resp *cloudsync.LoginResponse, apiURL string) (*Cr
 		UserID:   fmt.Sprintf("%d", resp.User.ID),
 		Email:    resp.User.Email,
 		Name:     resp.User.Name,
+		TeamID:   resp.TeamID,
 		DeviceID: devID,
 		APIURL:   apiURL,
 	}
@@ -176,14 +177,15 @@ func (m *Manager) finishLogin(resp *cloudsync.LoginResponse, apiURL string) (*Cr
 
 // LoginWithDeviceToken completes a device auth flow by saving the token
 // and user information returned from a successful device poll.
-func (m *Manager) LoginWithDeviceToken(token string, user cloudsync.UserResponse, apiURL string) (*Credentials, error) {
+func (m *Manager) LoginWithDeviceToken(token string, user cloudsync.UserResponse, teamID, apiURL string) (*Credentials, error) {
 	if apiURL != "" {
 		m.client.SetBaseURL(apiURL)
 	}
 	// Build a LoginResponse to reuse finishLogin.
 	resp := &cloudsync.LoginResponse{
-		Token: token,
-		User:  user,
+		Token:  token,
+		User:   user,
+		TeamID: teamID,
 	}
 	return m.finishLogin(resp, apiURL)
 }

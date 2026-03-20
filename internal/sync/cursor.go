@@ -15,9 +15,10 @@ import (
 type Cursor struct {
 	mu       sync.Mutex
 	path     string
-	DeviceID string            `json:"device_id"`
-	Versions map[string]int64  `json:"versions"` // storage path -> last synced version
-	LastSync *time.Time        `json:"last_sync_at,omitempty"`
+	DeviceID   string            `json:"device_id"`
+	Versions   map[string]int64  `json:"versions"`                 // storage path -> last synced version
+	LastSync   *time.Time        `json:"last_sync_at,omitempty"`
+	LastPullAt *time.Time        `json:"last_pull_at,omitempty"`   // timestamp of last successful pull
 }
 
 // NewCursor creates a cursor for the given workspace directory.
@@ -89,6 +90,23 @@ func (c *Cursor) SetLastSync(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.LastSync = &t
+}
+
+// SetLastPull records the pull timestamp.
+func (c *Cursor) SetLastPull(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.LastPullAt = &t
+}
+
+// GetLastPullRFC3339 returns the last pull timestamp as RFC3339, or empty string.
+func (c *Cursor) GetLastPullRFC3339() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.LastPullAt == nil {
+		return ""
+	}
+	return c.LastPullAt.Format(time.RFC3339)
 }
 
 // PendingCount returns the number of paths that differ from synced versions.

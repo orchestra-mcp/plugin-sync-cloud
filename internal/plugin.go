@@ -116,4 +116,11 @@ func (sp *SyncPlugin) RegisterTools(builder *plugin.PluginBuilder) {
 		tools.ConfigSchema(),
 		tools.ConfigHandler(sp),
 	)
+
+	builder.RegisterTool(
+		"list_team_members",
+		"List all team members from the Orchestra cloud. Returns person IDs, names, emails, roles, and statuses.",
+		tools.MembersSchema(),
+		tools.MembersHandler(sp),
+	)
 }

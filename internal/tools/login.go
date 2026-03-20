@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 
@@ -76,7 +77,7 @@ func LoginHandler(sp PluginAccessor) ToolHandler {
 				return &pluginv1.ToolResponse{Success: true, Result: result}, nil
 			}
 			// Approved — save credentials and start sync.
-			creds, err := authMgr.LoginWithDeviceToken(pollResp.Token, pollResp.User, apiURL)
+			creds, err := authMgr.LoginWithDeviceToken(pollResp.Token, pollResp.User, pollResp.TeamID, apiURL)
 			if err != nil {
 				return helpers.ErrorResult("auth_error", err.Error()), nil
 			}
@@ -132,8 +133,15 @@ func LoginHandler(sp PluginAccessor) ToolHandler {
 
 func loginSuccess(ctx context.Context, sp PluginAccessor, token, email, name, userID, deviceID, teamID, apiURL string) (*pluginv1.ToolResponse, error) {
 	// Start sync engine with new credentials.
+	var importCount int
 	if engine := sp.SyncEngine(); engine != nil {
 		engine.SetAuth(token, teamID, "", deviceID)
+		// Bootstrap local state from cloud on first login.
+		if n, err := engine.FullImport(ctx); err != nil {
+			log.Printf("sync.cloud: full import failed: %v", err)
+		} else {
+			importCount = n
+		}
 		engine.Start(ctx)
 	}
 
@@ -144,7 +152,8 @@ func loginSuccess(ctx context.Context, sp PluginAccessor, token, email, name, us
 		"user_id":   userID,
 		"device_id": deviceID,
 		"api_url":   apiURL,
-		"message":   fmt.Sprintf("Logged in as %s (%s). Sync is now active.", name, email),
+		"imported":  importCount,
+		"message":   fmt.Sprintf("Logged in as %s (%s). Imported %d entities. Sync is now active.", name, email, importCount),
 	})
 
 	return &pluginv1.ToolResponse{
