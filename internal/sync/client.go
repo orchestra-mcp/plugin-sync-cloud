@@ -280,6 +280,39 @@ func (cc *CloudClient) Pull(token string, req PullRequest) (*PullResponse, error
 	return &resp, nil
 }
 
+// DeltaRecord is a single changed entity ID returned by GET /api/sync/delta.
+type DeltaRecord struct {
+	EntityType string    `json:"entity_type"`
+	EntityID   string    `json:"entity_id"`
+	Action     string    `json:"action"` // upsert | delete
+	Version    int64     `json:"version"`
+	ChangedAt  time.Time `json:"changed_at"`
+}
+
+// DeltaResponse is the response from GET /api/sync/delta.
+type DeltaResponse struct {
+	Changes []DeltaRecord `json:"changes"`
+	Count   int           `json:"count"`
+	Since   string        `json:"since"`
+}
+
+// Delta fetches changed entity IDs since the given timestamp.
+// entityType is optional; pass "" to fetch all entity types.
+func (cc *CloudClient) Delta(token, since, entityType string, limit int) (*DeltaResponse, error) {
+	path := "/api/sync/delta?since=" + url.QueryEscape(since)
+	if entityType != "" {
+		path += "&entity_type=" + url.QueryEscape(entityType)
+	}
+	if limit > 0 {
+		path += "&limit=" + fmt.Sprintf("%d", limit)
+	}
+	var resp DeltaResponse
+	if err := cc.get(path, token, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // RegisterDevice registers this device with the cloud.
 func (cc *CloudClient) RegisterDevice(token, deviceID, name, platform string) error {
 	body := map[string]string{
